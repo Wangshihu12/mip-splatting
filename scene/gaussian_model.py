@@ -141,53 +141,86 @@ class GaussianModel:
 
     @torch.no_grad()
     def compute_3D_filter(self, cameras):
+        """
+        计算3D滤波器，用于控制高斯点的密度和可见性。
+        
+        该函数通过将所有3D点投影到各个相机视角，计算每个点到相机的距离，
+        并基于距离和焦距生成3D滤波器值。这个滤波器用于后续的密度控制过程。
+        
+        Args:
+            cameras: 相机列表，包含所有训练相机的参数（旋转矩阵、平移向量、焦距等）
+        
+        Returns:
+            无返回值，但会更新self.filter_3D属性
+        """
         print("Computing 3D filter")
-        #TODO consider focal length and image width
-        xyz = self.get_xyz
+        # TODO: 考虑焦距和图像宽度的影响
+        xyz = self.get_xyz  # 获取所有3D高斯点的坐标
+        # 初始化距离数组，默认距离为100000.0（表示很远）
         distance = torch.ones((xyz.shape[0]), device=xyz.device) * 100000.0
+        # 初始化有效点标记数组，用于标记哪些点在至少一个相机视角下是可见的
         valid_points = torch.zeros((xyz.shape[0]), device=xyz.device, dtype=torch.bool)
         
-        # we should use the focal length of the highest resolution camera
+        # 应该使用最高分辨率相机的焦距作为参考
         focal_length = 0.
+        
+        # 遍历所有相机
         for camera in cameras:
 
-            # transform points to camera space
-            R = torch.tensor(camera.R, device=xyz.device, dtype=torch.float32)
-            T = torch.tensor(camera.T, device=xyz.device, dtype=torch.float32)
-             # R is stored transposed due to 'glm' in CUDA code so we don't neet transopse here
-            xyz_cam = xyz @ R + T[None, :]
+            # 将3D点从世界坐标系变换到相机坐标系
+            R = torch.tensor(camera.R, device=xyz.device, dtype=torch.float32)  # 旋转矩阵
+            T = torch.tensor(camera.T, device=xyz.device, dtype=torch.float32)  # 平移向量
+            # R在CUDA代码中已经转置存储（由于'glm'库），所以这里不需要再次转置
+            xyz_cam = xyz @ R + T[None, :]  # 坐标变换：xyz_cam = xyz * R + T
             
+            # 计算3D点到相机中心的欧几里得距离
             xyz_to_cam = torch.norm(xyz_cam, dim=1)
             
-            # project to screen space
+            # 投影到屏幕空间
+            # 深度有效性检查：只考虑深度大于0.2的点（避免太近的点）
             valid_depth = xyz_cam[:, 2] > 0.2
             
-            
+            # 分解相机坐标系下的坐标
             x, y, z = xyz_cam[:, 0], xyz_cam[:, 1], xyz_cam[:, 2]
+            # 限制z值最小为0.001，避免除零错误
             z = torch.clamp(z, min=0.001)
             
+            # 透视投影：将3D坐标投影到2D屏幕坐标
+            # x_screen = (x / z) * focal_x + image_width / 2
+            # y_screen = (y / z) * focal_y + image_height / 2
             x = x / z * camera.focal_x + camera.image_width / 2.0
             y = y / z * camera.focal_y + camera.image_height / 2.0
             
+            # 注释掉的原始屏幕边界检查
             # in_screen = torch.logical_and(torch.logical_and(x >= 0, x < camera.image_width), torch.logical_and(y >= 0, y < camera.image_height))
             
-            # use similar tangent space filtering as in the paper
+            # 使用类似论文中的切线空间滤波方法
+            # 扩展屏幕边界15%，允许一些边界外的点也被考虑
             in_screen = torch.logical_and(torch.logical_and(x >= -0.15 * camera.image_width, x <= camera.image_width * 1.15), torch.logical_and(y >= -0.15 * camera.image_height, y <= 1.15 * camera.image_height))
             
-        
+            # 综合有效性检查：深度有效且在屏幕范围内
             valid = torch.logical_and(valid_depth, in_screen)
             
+            # 更新距离信息
+            # 注释掉的欧几里得距离版本
             # distance[valid] = torch.min(distance[valid], xyz_to_cam[valid])
+            # 使用z坐标（深度）作为距离度量，取最小值
             distance[valid] = torch.min(distance[valid], z[valid])
+            # 更新有效点标记：只要在任何一个相机下有效就算有效
             valid_points = torch.logical_or(valid_points, valid)
+            # 记录最大焦距，用于后续计算
             if focal_length < camera.focal_x:
                 focal_length = camera.focal_x
         
+        # 对于无效点，将距离设置为有效点的最大距离
         distance[~valid_points] = distance[valid_points].max()
         
-        #TODO remove hard coded value
-        #TODO box to gaussian transform
+        # TODO: 移除硬编码值
+        # TODO: 实现box到gaussian的变换
+        # 计算3D滤波器值：距离/焦距 * sqrt(0.2)
+        # 这个公式将距离标准化，并应用一个缩放因子
         filter_3D = distance / focal_length * (0.2 ** 0.5)
+        # 将滤波器值存储为列向量，用于后续的密度控制
         self.filter_3D = filter_3D[..., None]
         
     def oneupSHdegree(self):
